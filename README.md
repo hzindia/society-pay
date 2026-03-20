@@ -71,6 +71,42 @@ That's it. Your portal is live at `http://localhost:3000`
 docker compose exec backend node scripts/create-admin.js
 ```
 
+### 5. Make it Public (so members can access it)
+
+**Option A: Free Cloudflare Tunnel (recommended — ₹0/forever)**
+```bash
+# 1. Get a free tunnel token from Cloudflare Dashboard → Zero Trust → Tunnels
+# 2. Add to .env:
+CLOUDFLARE_TUNNEL_TOKEN=your_token_here
+
+# 3. Restart with tunnel:
+docker compose --profile tunnel up -d
+# → Your portal is now at https://pay.yoursociety.com
+```
+
+**Option B: Instant temporary share (for demos)**
+```bash
+./scripts/share.sh
+# → Gives you a public URL + QR code instantly (no account needed)
+```
+
+**Option C: VPS with auto HTTPS**
+```bash
+# Set your domain in .env:
+PUBLIC_DOMAIN=pay.yoursociety.com
+
+docker compose --profile production up -d
+# → Auto HTTPS via Let's Encrypt
+```
+
+### 6. Print QR Poster for Notice Board
+```bash
+./scripts/generate-poster.sh https://pay.yoursociety.com
+# → Opens a printable A4 poster with QR code
+```
+
+See [docs/PUBLIC-URL.md](docs/PUBLIC-URL.md) for detailed setup guides.
+
 ---
 
 ## 🔧 Configuration Reference

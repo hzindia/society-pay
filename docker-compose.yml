@@ -44,5 +44,41 @@ services:
     ports:
       - "3000:3000"
 
+  # ══════════════════════════════════════════════════════════════════════════
+  #  OPTIONAL PROFILES — activate with:  docker compose --profile <name> up -d
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # ── Cloudflare Tunnel (FREE public URL with your custom domain) ──────────
+  #    Activate: docker compose --profile tunnel up -d
+  #    Requires: CLOUDFLARE_TUNNEL_TOKEN set in .env
+  #    Result:   https://pay.yoursociety.com — free HTTPS, DDoS protection
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    depends_on:
+      - frontend
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+
+  # ── Caddy reverse proxy (auto HTTPS for VPS with public IP) ──────────────
+  #    Activate: docker compose --profile production up -d
+  #    Requires: PUBLIC_DOMAIN set in .env (e.g. pay.greenvalley.in)
+  #    Result:   https://pay.greenvalley.in with auto Let's Encrypt certs
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    profiles: ["production"]
+    depends_on:
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+
 volumes:
   pgdata:
+  caddy_data:
+  caddy_config:

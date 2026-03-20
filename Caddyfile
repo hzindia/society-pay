@@ -1,0 +1,38 @@
+# ============================================================================
+#  Caddy — Automatic HTTPS Reverse Proxy for SocietyPay
+#
+#  Usage: Set PUBLIC_DOMAIN in .env, then:
+#         docker compose --profile production up -d
+#
+#  Caddy automatically obtains and renews Let's Encrypt SSL certificates.
+#  Make sure ports 80 and 443 are open on your server/firewall.
+# ============================================================================
+
+{$PUBLIC_DOMAIN:localhost} {
+    # API requests → backend
+    handle /api/* {
+        reverse_proxy backend:4000
+    }
+
+    # Everything else → frontend (React SPA)
+    handle {
+        reverse_proxy frontend:3000
+    }
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+
+    # Gzip
+    encode gzip
+
+    # Logging
+    log {
+        output stdout
+        format console
+    }
+}
