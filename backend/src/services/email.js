@@ -34,6 +34,11 @@ async function sendPaymentConfirmation(payment, user) {
     return false;
   }
 
+  if (!user || !user.email) {
+    console.warn("⚠️  User not provided or missing email, skipping notification");
+    return false;
+  }
+
   const surchargeRow = payment.surchargeAmount > 0
     ? `<tr><td style="padding:8px 0;color:#666">Surcharge (${(payment.surchargeRate * 100).toFixed(1)}%)</td><td style="padding:8px 0;text-align:right;color:#dc2626">+ ${formatCurrency(payment.surchargeAmount)}</td></tr>`
     : "";

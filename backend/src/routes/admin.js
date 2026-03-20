@@ -1,10 +1,9 @@
 const express = require("express");
-const { PrismaClient } = require("@prisma/client");
 const { authenticate, requireAdmin } = require("../middleware/auth");
 const config = require("../utils/config");
+const prisma = require("../utils/prisma");
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 // All admin routes require authentication + admin role
 router.use(authenticate, requireAdmin);
@@ -186,7 +185,8 @@ router.get("/export/csv", async (req, res) => {
       p.razorpayPaymentId || "",
     ]);
 
-    const csv = [headers.join(","), ...rows.map((r) => r.map((v) => `"${v}"`).join(","))].join("\n");
+    const escapeCell = (v) => `"${String(v).replace(/"/g, '""')}"`;
+    const csv = [headers.join(","), ...rows.map((r) => r.map(escapeCell).join(","))].join("\n");
 
     res.setHeader("Content-Type", "text/csv");
     res.setHeader("Content-Disposition", `attachment; filename=payments-${new Date().toISOString().slice(0, 10)}.csv`);

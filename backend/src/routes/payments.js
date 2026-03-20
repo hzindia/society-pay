@@ -1,14 +1,13 @@
 const express = require("express");
 const { body, query, validationResult } = require("express-validator");
-const { PrismaClient } = require("@prisma/client");
 const crypto = require("crypto");
 const config = require("../utils/config");
 const { authenticate } = require("../middleware/auth");
 const razorpayService = require("../services/razorpay");
 const emailService = require("../services/email");
+const prisma = require("../utils/prisma");
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 /**
  * Generate human-readable transaction ID

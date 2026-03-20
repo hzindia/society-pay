@@ -1,12 +1,11 @@
 const express = require("express");
 const bcrypt = require("bcrypt");
 const { body, validationResult } = require("express-validator");
-const { PrismaClient } = require("@prisma/client");
 const config = require("../utils/config");
 const { authenticate, requireAdmin } = require("../middleware/auth");
+const prisma = require("../utils/prisma");
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 // ── List Residents (admin) ──────────────────────────────────────────────────
 router.get("/", authenticate, requireAdmin, async (req, res) => {
@@ -114,6 +113,9 @@ router.put("/:id", authenticate, requireAdmin, async (req, res) => {
 
     res.json({ resident: user });
   } catch (err) {
+    if (err.code === "P2025") {
+      return res.status(404).json({ error: "Resident not found" });
+    }
     console.error("Update resident error:", err);
     res.status(500).json({ error: "Failed to update resident" });
   }
@@ -128,6 +130,9 @@ router.delete("/:id", authenticate, requireAdmin, async (req, res) => {
     });
     res.json({ message: "Resident deactivated" });
   } catch (err) {
+    if (err.code === "P2025") {
+      return res.status(404).json({ error: "Resident not found" });
+    }
     console.error("Deactivate error:", err);
     res.status(500).json({ error: "Failed to deactivate resident" });
   }
