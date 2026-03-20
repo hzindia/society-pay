@@ -111,8 +111,16 @@ router.get("/payments", async (req, res) => {
     if (req.query.paymentMethod) where.paymentMethod = req.query.paymentMethod;
     if (req.query.from || req.query.to) {
       where.createdAt = {};
-      if (req.query.from) where.createdAt.gte = new Date(req.query.from);
-      if (req.query.to) where.createdAt.lte = new Date(req.query.to);
+      if (req.query.from) {
+        const d = new Date(req.query.from);
+        if (isNaN(d.getTime())) return res.status(400).json({ error: "Invalid 'from' date" });
+        where.createdAt.gte = d;
+      }
+      if (req.query.to) {
+        const d = new Date(req.query.to);
+        if (isNaN(d.getTime())) return res.status(400).json({ error: "Invalid 'to' date" });
+        where.createdAt.lte = d;
+      }
     }
     if (req.query.search) {
       where.OR = [
@@ -149,8 +157,16 @@ router.get("/export/csv", async (req, res) => {
     const where = {};
     if (req.query.from || req.query.to) {
       where.paidAt = {};
-      if (req.query.from) where.paidAt.gte = new Date(req.query.from);
-      if (req.query.to) where.paidAt.lte = new Date(req.query.to);
+      if (req.query.from) {
+        const d = new Date(req.query.from);
+        if (isNaN(d.getTime())) return res.status(400).json({ error: "Invalid 'from' date" });
+        where.paidAt.gte = d;
+      }
+      if (req.query.to) {
+        const d = new Date(req.query.to);
+        if (isNaN(d.getTime())) return res.status(400).json({ error: "Invalid 'to' date" });
+        where.paidAt.lte = d;
+      }
     }
     if (req.query.status) where.status = req.query.status;
 

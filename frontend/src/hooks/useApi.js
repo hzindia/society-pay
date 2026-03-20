@@ -32,7 +32,7 @@ export function useApi(path, options = {}) {
     if (immediate && path) {
       fetch();
     }
-  }, [path, immediate]);
+  }, [path, immediate, fetch]);
 
   return { data, loading, error, refetch: fetch };
 }

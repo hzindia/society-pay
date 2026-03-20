@@ -56,6 +56,7 @@ export default function AdminDashboard() {
       const res = await fetch("/api/admin/export/csv", {
         headers: { Authorization: `Bearer ${token}` },
       });
+      if (!res.ok) throw new Error(`Export failed: ${res.status}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");

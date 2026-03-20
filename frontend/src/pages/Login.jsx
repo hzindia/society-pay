@@ -16,7 +16,7 @@ export default function Login() {
 
   useEffect(() => {
     if (user) navigate("/", { replace: true });
-  }, [user]);
+  }, [user, navigate]);
 
   function update(field, value) {
     setForm((f) => ({ ...f, [field]: value }));

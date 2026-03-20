@@ -20,7 +20,9 @@ function optionalEnv(key, defaultVal = "") {
 
 function numEnv(key, defaultVal = 0) {
   const val = process.env[key];
-  return val !== undefined ? parseFloat(val) : defaultVal;
+  if (val === undefined) return defaultVal;
+  const parsed = parseFloat(val);
+  return isNaN(parsed) ? defaultVal : parsed;
 }
 
 function boolEnv(key, defaultVal = false) {

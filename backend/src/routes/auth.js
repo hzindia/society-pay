@@ -2,12 +2,11 @@ const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { body, validationResult } = require("express-validator");
-const { PrismaClient } = require("@prisma/client");
 const config = require("../utils/config");
 const { authenticate } = require("../middleware/auth");
+const prisma = require("../utils/prisma");
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 // ── Register ────────────────────────────────────────────────────────────────
 router.post(
@@ -133,6 +132,9 @@ router.put(
       const { currentPassword, newPassword } = req.body;
 
       const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
       const valid = await bcrypt.compare(currentPassword, user.passwordHash);
       if (!valid) {
         return res.status(401).json({ error: "Current password is incorrect" });
