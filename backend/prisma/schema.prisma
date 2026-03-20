@@ -1,0 +1,94 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  RESIDENT
+  ADMIN
+  TREASURER
+}
+
+enum PaymentStatus {
+  CREATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  phone         String?
+  passwordHash  String
+  name          String
+  flatNumber    String
+  wing          String?
+  role          Role      @default(RESIDENT)
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  payments      Payment[]
+
+  @@index([flatNumber])
+  @@index([role])
+}
+
+model Payment {
+  id                  String        @id @default(cuid())
+  transactionId       String        @unique   // Human-readable: SOC-XXXX-XXXX
+  userId              String
+  user                User          @relation(fields: [userId], references: [id])
+
+  // Payment details
+  paymentType         String        // "Monthly Maintenance", "Parking", etc.
+  description         String?
+  baseAmount          Float         // Amount before surcharges (in INR)
+  paymentMethod       String        // "credit_card", "upi", etc.
+  surchargeRate       Float         @default(0)  // e.g. 0.02 for 2%
+  surchargeAmount     Float         @default(0)
+  gstOnSurcharge      Float         @default(0)
+  totalAmount         Float         // Final amount charged
+
+  // Razorpay fields
+  razorpayOrderId     String?       @unique
+  razorpayPaymentId   String?       @unique
+  razorpaySignature   String?
+
+  // Status
+  status              PaymentStatus @default(CREATED)
+  paidAt              DateTime?
+  failureReason       String?
+
+  // Metadata
+  receiptUrl          String?
+  emailSent           Boolean       @default(false)
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([paymentType])
+  @@index([razorpayOrderId])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  userId      String?
+  action      String   // "payment.created", "payment.captured", "user.login", etc.
+  entityType  String?  // "payment", "user"
+  entityId    String?
+  metadata    Json?
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}
