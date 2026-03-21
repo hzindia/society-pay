@@ -170,19 +170,34 @@ router.post(
         return res.status(400).json({ error: "Payment verification failed — invalid signature" });
       }
 
-      // Update payment record
-      const payment = await prisma.payment.update({
-        where: { razorpayOrderId },
-        data: {
-          razorpayPaymentId,
-          razorpaySignature,
-          status: "CAPTURED",
-          paidAt: new Date(),
-        },
-        include: { user: true },
+      // Update payment record and audit log atomically
+      const payment = await prisma.$transaction(async (tx) => {
+        const updated = await tx.payment.update({
+          where: { razorpayOrderId },
+          data: {
+            razorpayPaymentId,
+            razorpaySignature,
+            status: "CAPTURED",
+            paidAt: new Date(),
+          },
+          include: { user: true },
+        });
+
+        await tx.auditLog.create({
+          data: {
+            userId: updated.userId,
+            action: "payment.captured",
+            entityType: "payment",
+            entityId: updated.id,
+            metadata: { razorpayPaymentId, totalAmount: updated.totalAmount },
+            ipAddress: req.ip,
+          },
+        });
+
+        return updated;
       });
 
-      // Send email receipt
+      // Send email receipt (outside transaction — non-critical, best-effort)
       const emailSent = await emailService.sendPaymentConfirmation(payment, payment.user);
       if (emailSent) {
         await prisma.payment.update({
@@ -190,18 +205,6 @@ router.post(
           data: { emailSent: true },
         });
       }
-
-      // Audit log
-      await prisma.auditLog.create({
-        data: {
-          userId: payment.userId,
-          action: "payment.captured",
-          entityType: "payment",
-          entityId: payment.id,
-          metadata: { razorpayPaymentId, totalAmount: payment.totalAmount },
-          ipAddress: req.ip,
-        },
-      });
 
       res.json({
         success: true,
@@ -249,18 +252,46 @@ router.post("/webhook", async (req, res) => {
 
     console.log(`📥 Webhook: ${eventType}`);
 
-    if (eventType === "payment.captured") {
+    if (eventType === "payment.authorized") {
+      // Some payment methods (e.g. net banking) send authorized before captured.
+      // Mark as AUTHORIZED so the UI can show it as pending capture.
+      const rpPayment = payload.payment.entity;
+      const orderId = rpPayment.order_id;
+      await prisma.payment.updateMany({
+        where: { razorpayOrderId: orderId, status: "CREATED" },
+        data: { razorpayPaymentId: rpPayment.id, status: "AUTHORIZED" },
+      });
+    } else if (eventType === "payment.captured") {
       const rpPayment = payload.payment.entity;
       const orderId = rpPayment.order_id;
 
-      await prisma.payment.updateMany({
+      // Find the payment before update so we can check if email needs sending
+      const existing = await prisma.payment.findFirst({
         where: { razorpayOrderId: orderId, status: { not: "CAPTURED" } },
-        data: {
-          razorpayPaymentId: rpPayment.id,
-          status: "CAPTURED",
-          paidAt: new Date(rpPayment.created_at * 1000),
-        },
+        include: { user: true },
       });
+
+      if (existing) {
+        await prisma.payment.updateMany({
+          where: { razorpayOrderId: orderId, status: { not: "CAPTURED" } },
+          data: {
+            razorpayPaymentId: rpPayment.id,
+            status: "CAPTURED",
+            paidAt: new Date(rpPayment.created_at * 1000),
+          },
+        });
+
+        // Send email if not already sent (covers case where /verify never reached)
+        if (!existing.emailSent) {
+          const emailSent = await emailService.sendPaymentConfirmation(existing, existing.user);
+          if (emailSent) {
+            await prisma.payment.updateMany({
+              where: { razorpayOrderId: orderId },
+              data: { emailSent: true },
+            });
+          }
+        }
+      }
     } else if (eventType === "payment.failed") {
       const rpPayment = payload.payment.entity;
       const orderId = rpPayment.order_id;
@@ -285,8 +316,8 @@ router.post("/webhook", async (req, res) => {
 // ── Payment History (for logged-in resident) ────────────────────────────────
 router.get("/history", authenticate, async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 20), 100);
     const skip = (page - 1) * limit;
 
     const [payments, total] = await Promise.all([

@@ -10,8 +10,8 @@ const router = express.Router();
 // ── List Residents (admin) ──────────────────────────────────────────────────
 router.get("/", authenticate, requireAdmin, async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 50), 200);
     const skip = (page - 1) * limit;
 
     const where = { role: "RESIDENT" };
@@ -111,6 +111,17 @@ router.put("/:id", authenticate, requireAdmin, async (req, res) => {
       select: { id: true, email: true, name: true, flatNumber: true, wing: true, role: true, isActive: true },
     });
 
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user.id,
+        action: "resident.updated",
+        entityType: "user",
+        entityId: user.id,
+        metadata: { changes: updateData },
+        ipAddress: req.ip,
+      },
+    });
+
     res.json({ resident: user });
   } catch (err) {
     if (err.code === "P2025") {
@@ -128,6 +139,17 @@ router.delete("/:id", authenticate, requireAdmin, async (req, res) => {
       where: { id: req.params.id },
       data: { isActive: false },
     });
+
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user.id,
+        action: "resident.deactivated",
+        entityType: "user",
+        entityId: req.params.id,
+        ipAddress: req.ip,
+      },
+    });
+
     res.json({ message: "Resident deactivated" });
   } catch (err) {
     if (err.code === "P2025") {

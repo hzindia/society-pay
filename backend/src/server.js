@@ -24,8 +24,8 @@ app.use(cors({
 app.use("/api/payments/webhook", express.raw({ type: "application/json" }));
 
 // ── Body parsing ────────────────────────────────────────────────────────────
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "50kb" }));
+app.use(express.urlencoded({ extended: true, limit: "50kb" }));
 
 // ── Logging ─────────────────────────────────────────────────────────────────
 if (config.env !== "test") {

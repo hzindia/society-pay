@@ -52,10 +52,10 @@ cp .env.example .env
 
 Open `.env` and fill in:
 - Your **society name and details**
-- **Razorpay** API keys (from Razorpay Dashboard → Settings → API Keys)
-- **Razorpay Webhook Secret** (from Dashboard → Webhooks → Create, use endpoint: `https://yourdomain.com/api/payments/webhook`)
-- **SMTP email** credentials (Gmail, SendGrid, etc.)
-- **JWT secret** (any random long string)
+- **Razorpay API keys** → [dashboard.razorpay.com/app/keys](https://dashboard.razorpay.com/app/keys) *(see [Razorpay Integration Guide](#-razorpay-integration-guide) below)*
+- **Razorpay Webhook Secret** → [dashboard.razorpay.com/app/webhooks](https://dashboard.razorpay.com/app/webhooks), webhook URL: `https://yourdomain.com/api/payments/webhook`
+- **SMTP email** credentials (Gmail App Password → [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords))
+- **JWT secret** — generate one with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
 
 ### 3. Deploy
 
@@ -142,6 +142,120 @@ All configuration lives in a single `.env` file. See `.env.example` for all opti
 
 ---
 
+## 💳 Razorpay Integration Guide
+
+SocietyPay uses [Razorpay](https://razorpay.com) as the payment gateway. Setup takes about 10 minutes.
+
+### Step 1 — Create a Razorpay Account
+
+1. Sign up at **[dashboard.razorpay.com](https://dashboard.razorpay.com/register)**
+2. Complete KYC (PAN + bank account of the society/treasurer)
+3. You can test with **Test Mode** keys before going live — no KYC needed for testing
+
+> **Charges:** Razorpay charges ~2% per transaction (UPI is free). No monthly fee.
+
+---
+
+### Step 2 — Get Your API Keys
+
+1. Log in → **Settings** → **API Keys** → **[Generate API Key](https://dashboard.razorpay.com/app/keys)**
+2. Copy both values into your `.env`:
+
+```env
+RAZORPAY_KEY_ID=rzp_test_xxxxxxxxxxxxxxx    # starts with rzp_test_ (test) or rzp_live_ (production)
+RAZORPAY_KEY_SECRET=CHANGE_ME_your_razorpay_key_secret
+```
+
+> Keep `rzp_test_` keys during development. Switch to `rzp_live_` keys when going live.
+> **Never commit the secret key to Git.**
+
+---
+
+### Step 3 — Create a Webhook
+
+Webhooks allow Razorpay to notify your server when a payment is captured, even if the user closes the browser mid-payment. This is critical for payment reliability.
+
+1. Go to **Settings** → **Webhooks** → **[Create New Webhook](https://dashboard.razorpay.com/app/webhooks)**
+2. Set the **Webhook URL** to:
+   ```
+   https://yourdomain.com/api/payments/webhook
+   ```
+   *(Use your Cloudflare Tunnel or VPS domain — must be publicly accessible)*
+3. Under **Active Events**, enable:
+   - `payment.authorized`
+   - `payment.captured`
+   - `payment.failed`
+4. Copy the **Webhook Secret** into your `.env`:
+   ```env
+   RAZORPAY_WEBHOOK_SECRET=CHANGE_ME_your_webhook_secret
+   ```
+
+> **Local testing:** Use [ngrok](https://ngrok.com) or the Cloudflare Tunnel (`--profile tunnel`) to expose your local server, then set the tunnel URL as the webhook URL.
+
+---
+
+### Step 4 — Go Live Checklist
+
+Before switching from test to live keys:
+
+- [ ] KYC completed on Razorpay dashboard
+- [ ] Bank account verified and settlement configured
+- [ ] Switched `.env` to `rzp_live_` keys
+- [ ] Webhook URL updated to your production domain
+- [ ] Test a real ₹1 payment end-to-end
+- [ ] Confirm email receipt is delivered
+
+---
+
+### How Payments Work (Flow)
+
+```
+Resident clicks Pay
+       │
+       ▼
+Backend creates Razorpay Order ──► Razorpay API
+       │                                │
+       │ orderId returned               │
+       ▼                                │
+Frontend opens Razorpay Checkout        │
+       │                                │
+       │ User pays (UPI / Card / etc.)  │
+       ▼                                ▼
+Backend /verify endpoint       Razorpay Webhook
+  (signature check)            (server-to-server)
+       │                                │
+       └──────────────┬─────────────────┘
+                      ▼
+              DB: status → CAPTURED
+              Email receipt sent
+```
+
+Both `/verify` (client-side callback) and the webhook independently mark a payment as captured — whichever fires first wins, the second is a safe no-op. This ensures no payment is lost even if the user's browser crashes.
+
+---
+
+### Surcharge Configuration
+
+You can pass on Razorpay's transaction fees to residents by configuring surcharges in `.env`:
+
+```env
+SURCHARGE_CREDIT_CARD=2.0    # 2% surcharge on credit card payments
+SURCHARGE_DEBIT_CARD=0       # No surcharge
+SURCHARGE_UPI=0              # UPI is free — no surcharge
+SURCHARGE_NET_BANKING=0.5    # 0.5% surcharge
+SURCHARGE_WALLET=1.0         # 1% surcharge
+```
+
+The surcharge is shown transparently to the resident before they pay. If GST applies to surcharges:
+
+```env
+GST_ENABLED=true
+GST_RATE=18              # 18% GST on the surcharge amount (not the total)
+SOCIETY_GSTIN=27XXXXX    # Your society's GSTIN
+```
+
+---
+
 ## 📁 Project Structure
 
 ```
@@ -198,14 +312,17 @@ society-pay/
 
 ## 🔒 Security
 
-- Razorpay webhook signature verification (HMAC SHA256)
-- JWT tokens with expiry for authentication
-- bcrypt password hashing
-- Rate limiting on auth and payment endpoints
-- CORS restricted to your domain
-- Helmet.js security headers
-- SQL injection prevention via Prisma ORM
-- Input validation with express-validator
+- Razorpay webhook signature verification (HMAC SHA256 with **timing-safe comparison**)
+- Payment signature verified on both client callback and server webhook independently
+- JWT tokens with expiry for all authenticated routes
+- bcrypt password hashing (configurable rounds)
+- Rate limiting on auth (10 req/15min) and all API endpoints (100 req/15min)
+- CORS restricted to your configured frontend domain
+- Helmet.js security headers (CSP, HSTS, X-Frame-Options, etc.)
+- SQL injection prevention via Prisma ORM parameterized queries
+- Input validation with express-validator on all mutation endpoints
+- Atomic DB writes via Prisma transactions — no partial payment state on server crash
+- All admin actions (resident update/deactivate) recorded in audit log
 
 ---
 

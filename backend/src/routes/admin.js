@@ -101,8 +101,8 @@ router.get("/dashboard", async (req, res) => {
 // ── All Payments (with filters) ─────────────────────────────────────────────
 router.get("/payments", async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 50), 200);
     const skip = (page - 1) * limit;
 
     const where = {};
