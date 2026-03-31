@@ -32,6 +32,8 @@ export default function PaymentPortal() {
   const [processing, setProcessing] = useState(false);
   const [receipt, setReceipt] = useState(null);
   const [error, setError] = useState("");
+  // Stored after create-order so we can check status if verify fails
+  const [pendingOrderId, setPendingOrderId] = useState(null);
 
   const surcharges = config?.payment?.surcharges || {};
   const paymentTypes = config?.payment?.types || [];
@@ -65,6 +67,12 @@ export default function PaymentPortal() {
   async function handlePay() {
     setProcessing(true);
     setError("");
+    setPendingOrderId(null);
+
+    // One UUID per payment attempt. If the request is retried (network blip,
+    // double-click) the backend returns the already-created order instead of
+    // making a new one, preventing duplicate charges.
+    const idempotencyKey = crypto.randomUUID();
 
     try {
       // 1. Create order on backend
@@ -73,7 +81,11 @@ export default function PaymentPortal() {
         paymentMethod: method,
         paymentType,
         description,
+        idempotencyKey,
       });
+
+      // Remember the orderId so we can check status if /verify fails later
+      setPendingOrderId(rpConfig.orderId);
 
       // 2. Open Razorpay checkout
       const options = {
@@ -103,10 +115,13 @@ export default function PaymentPortal() {
               razorpaySignature: response.razorpay_signature,
             });
 
+            setPendingOrderId(null);
             setReceipt(result.payment);
             setStep(4);
-          } catch (err) {
-            setError("Payment verification failed. If amount was deducted, it will be refunded within 5-7 days.");
+          } catch {
+            // /verify failed — could be a transient network error. The webhook
+            // may still capture the payment server-side. Offer a status check.
+            setError("VERIFY_FAILED");
           }
           setProcessing(false);
         },
@@ -114,6 +129,7 @@ export default function PaymentPortal() {
         modal: {
           ondismiss: function () {
             setProcessing(false);
+            setPendingOrderId(null);
             setError("Payment was cancelled");
           },
         },
@@ -133,12 +149,40 @@ export default function PaymentPortal() {
       const rzp = new window.Razorpay(options);
       rzp.on("payment.failed", function (response) {
         setProcessing(false);
+        setPendingOrderId(null);
         setError(`Payment failed: ${response.error.description}`);
       });
       rzp.open();
     } catch (err) {
       setProcessing(false);
       setError(err.message || "Failed to initiate payment");
+    }
+  }
+
+  // ── Check status after a verify failure ─────────────────────────────────
+  async function handleCheckStatus() {
+    if (!pendingOrderId) return;
+    setProcessing(true);
+    setError("");
+    try {
+      const result = await api.get(`/payments/status/${pendingOrderId}`);
+      if (result.status === "CAPTURED") {
+        // Payment went through — fetch full receipt details
+        const history = await api.get("/payments/history?limit=1");
+        const latest = history.payments?.[0];
+        setPendingOrderId(null);
+        setReceipt(latest || { transactionId: result.transactionId, totalAmount: result.totalAmount, status: "CAPTURED", paidAt: result.paidAt });
+        setStep(4);
+      } else if (result.status === "FAILED") {
+        setPendingOrderId(null);
+        setError(`Payment failed${result.message ? `: ${result.message}` : ""}`);
+      } else {
+        setError("Payment is still being processed. Please wait a moment and try again.");
+      }
+    } catch {
+      setError("Could not check payment status. Please contact support if your account was debited.");
+    } finally {
+      setProcessing(false);
     }
   }
 
@@ -150,6 +194,7 @@ export default function PaymentPortal() {
     setMethod("");
     setReceipt(null);
     setError("");
+    setPendingOrderId(null);
   }
 
   return (
@@ -174,11 +219,23 @@ export default function PaymentPortal() {
         </div>
       )}
 
-      {error && (
+      {error === "VERIFY_FAILED" ? (
+        <div className="mb-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-sm">
+          <p className="font-semibold mb-1">Payment confirmation could not be verified</p>
+          <p className="mb-3 text-amber-700">Your payment may have gone through. Check the status before trying again to avoid a duplicate charge.</p>
+          <button
+            onClick={handleCheckStatus}
+            disabled={processing}
+            className="px-4 py-1.5 rounded-lg bg-amber-600 text-white text-sm font-semibold hover:bg-amber-700 disabled:opacity-50"
+          >
+            {processing ? "Checking..." : "Check Payment Status"}
+          </button>
+        </div>
+      ) : error ? (
         <div className="mb-4 px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm font-medium">
           {error}
         </div>
-      )}
+      ) : null}
 
       <div className="animate-fade-up" key={step}>
 

@@ -65,17 +65,55 @@ model Payment {
   paidAt              DateTime?
   failureReason       String?
 
+  // Idempotency & lifecycle
+  idempotencyKey      String?       @unique   // Client-generated key to prevent duplicate orders
+  expiresAt           DateTime?               // Razorpay order expiry (30 min from creation)
+  emailSent           Boolean       @default(false)
+  emailAttempts       Int           @default(0)
+
   // Metadata
   receiptUrl          String?
-  emailSent           Boolean       @default(false)
   createdAt           DateTime      @default(now())
   updatedAt           DateTime      @updatedAt
+
+  events              PaymentEvent[]
 
   @@index([userId])
   @@index([status])
   @@index([createdAt])
   @@index([paymentType])
   @@index([razorpayOrderId])
+}
+
+// Per-step state log — every status transition is recorded with source and context
+model PaymentEvent {
+  id          String         @id @default(cuid())
+  paymentId   String
+  payment     Payment        @relation(fields: [paymentId], references: [id])
+  fromStatus  PaymentStatus?
+  toStatus    PaymentStatus
+  source      String         // "client_create", "client_verify", "webhook", "reconcile"
+  metadata    Json?
+  createdAt   DateTime       @default(now())
+
+  @@index([paymentId])
+  @@index([createdAt])
+}
+
+// Webhook deduplication — prevents reprocessing Razorpay retries
+model WebhookEvent {
+  id              String    @id @default(cuid())
+  razorpayEventId String?   @unique   // Razorpay's own event ID (from payload.id)
+  eventType       String
+  orderId         String?
+  processed       Boolean   @default(false)
+  processedAt     DateTime?
+  error           String?
+  payload         Json
+  createdAt       DateTime  @default(now())
+
+  @@index([orderId])
+  @@index([createdAt])
 }
 
 model AuditLog {

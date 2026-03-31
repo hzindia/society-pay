@@ -1,5 +1,5 @@
 const express = require("express");
-const { body, query, validationResult } = require("express-validator");
+const { body, validationResult } = require("express-validator");
 const crypto = require("crypto");
 const config = require("../utils/config");
 const { authenticate } = require("../middleware/auth");
@@ -8,6 +8,9 @@ const emailService = require("../services/email");
 const prisma = require("../utils/prisma");
 
 const router = express.Router();
+
+// Razorpay orders expire after 15 minutes by default (we use 30 to be safe)
+const ORDER_EXPIRY_MS = 30 * 60 * 1000;
 
 /**
  * Generate human-readable transaction ID
@@ -18,6 +21,38 @@ function generateTransactionId() {
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const rand = crypto.randomBytes(4).toString("hex").toUpperCase();
   return `SOC-${y}${m}-${rand}`;
+}
+
+/**
+ * Log a payment state transition to the PaymentEvent table.
+ * Uses the provided Prisma client (tx inside a transaction, or prisma directly).
+ */
+async function logPaymentEvent(client, { paymentId, fromStatus, toStatus, source, metadata }) {
+  return client.paymentEvent.create({
+    data: { paymentId, fromStatus: fromStatus || null, toStatus, source, metadata: metadata || null },
+  });
+}
+
+/**
+ * Fire-and-forget email with attempt tracking.
+ * Never throws — all errors are logged.
+ */
+function sendEmailAsync(payment, user) {
+  if (payment.emailSent) return;
+  emailService.sendPaymentConfirmation(payment, user)
+    .then((sent) => {
+      prisma.payment.update({
+        where: { id: payment.id },
+        data: { emailSent: sent, emailAttempts: { increment: 1 } },
+      }).catch((err) => console.error("Email attempt tracking failed:", err));
+    })
+    .catch((err) => {
+      console.error("Email send error:", err.message);
+      prisma.payment.update({
+        where: { id: payment.id },
+        data: { emailAttempts: { increment: 1 } },
+      }).catch(() => {});
+    });
 }
 
 // ── Calculate Surcharge (public, no auth needed) ────────────────────────────
@@ -43,6 +78,10 @@ router.post("/calculate", [
 });
 
 // ── Create Payment Order ────────────────────────────────────────────────────
+// Accepts an optional `idempotencyKey` from the client (UUID generated per
+// payment attempt). If the same key is presented again — network retry, double
+// click, tab refresh — we return the already-created order instead of making
+// a duplicate Razorpay order.
 router.post(
   "/create-order",
   authenticate,
@@ -51,6 +90,7 @@ router.post(
     body("paymentMethod").isIn(["credit_card", "debit_card", "upi", "net_banking", "wallet"]),
     body("paymentType").trim().notEmpty(),
     body("description").optional().trim(),
+    body("idempotencyKey").optional().trim().isLength({ max: 64 }),
   ],
   async (req, res) => {
     try {
@@ -59,21 +99,48 @@ router.post(
         return res.status(400).json({ error: errors.array()[0].msg });
       }
 
-      const { baseAmount, paymentMethod, paymentType, description } = req.body;
+      const { baseAmount, paymentMethod, paymentType, description, idempotencyKey } = req.body;
 
-      // Validate payment type
       if (!config.payment.types.includes(paymentType)) {
         return res.status(400).json({ error: "Invalid payment type" });
       }
 
-      // Calculate surcharge
+      // ── Idempotency: return existing order if key was seen before ────────
+      if (idempotencyKey) {
+        const existing = await prisma.payment.findFirst({
+          where: { idempotencyKey, userId: req.user.id },
+        });
+        if (existing && existing.razorpayOrderId) {
+          return res.status(201).json({
+            payment: {
+              id: existing.id,
+              transactionId: existing.transactionId,
+              baseAmount: existing.baseAmount,
+              surchargeRate: existing.surchargeRate,
+              surchargeAmount: existing.surchargeAmount,
+              gstOnSurcharge: existing.gstOnSurcharge,
+              totalAmount: existing.totalAmount,
+              paymentMethod: existing.paymentMethod,
+              paymentType: existing.paymentType,
+            },
+            razorpay: {
+              orderId: existing.razorpayOrderId,
+              amount: Math.round(existing.totalAmount * 100),
+              currency: config.payment.currency,
+              keyId: config.razorpay.keyId,
+            },
+            society: { name: config.society.name, email: config.society.email },
+          });
+        }
+      }
+
+      // ── Calculate surcharge ───────────────────────────────────────────────
       const { surchargeRate, surchargeAmount, gstOnSurcharge, totalAmount } =
         razorpayService.calculateSurcharge(baseAmount, paymentMethod);
 
-      // Generate transaction ID
       const transactionId = generateTransactionId();
 
-      // Create Razorpay order
+      // ── Create Razorpay order ─────────────────────────────────────────────
       const razorpayOrder = await razorpayService.createOrder({
         totalAmount,
         transactionId,
@@ -81,34 +148,47 @@ router.post(
         paymentType,
       });
 
-      // Save payment in DB
-      const payment = await prisma.payment.create({
-        data: {
-          transactionId,
-          userId: req.user.id,
-          paymentType,
-          description,
-          baseAmount,
-          paymentMethod,
-          surchargeRate,
-          surchargeAmount,
-          gstOnSurcharge,
-          totalAmount,
-          razorpayOrderId: razorpayOrder.id,
-          status: "CREATED",
-        },
-      });
+      // ── Persist payment + first event atomically ──────────────────────────
+      const payment = await prisma.$transaction(async (tx) => {
+        const p = await tx.payment.create({
+          data: {
+            transactionId,
+            userId: req.user.id,
+            paymentType,
+            description,
+            baseAmount,
+            paymentMethod,
+            surchargeRate,
+            surchargeAmount,
+            gstOnSurcharge,
+            totalAmount,
+            razorpayOrderId: razorpayOrder.id,
+            idempotencyKey: idempotencyKey || null,
+            expiresAt: new Date(Date.now() + ORDER_EXPIRY_MS),
+            status: "CREATED",
+          },
+        });
 
-      // Audit log
-      await prisma.auditLog.create({
-        data: {
-          userId: req.user.id,
-          action: "payment.created",
-          entityType: "payment",
-          entityId: payment.id,
-          metadata: { transactionId, totalAmount, paymentMethod },
-          ipAddress: req.ip,
-        },
+        await logPaymentEvent(tx, {
+          paymentId: p.id,
+          fromStatus: null,
+          toStatus: "CREATED",
+          source: "client_create",
+          metadata: { transactionId, totalAmount, paymentMethod, ipAddress: req.ip },
+        });
+
+        await tx.auditLog.create({
+          data: {
+            userId: req.user.id,
+            action: "payment.created",
+            entityType: "payment",
+            entityId: p.id,
+            metadata: { transactionId, totalAmount, paymentMethod },
+            ipAddress: req.ip,
+          },
+        });
+
+        return p;
       });
 
       res.status(201).json({
@@ -127,7 +207,7 @@ router.post(
           orderId: razorpayOrder.id,
           amount: razorpayOrder.amount,
           currency: razorpayOrder.currency,
-          keyId: config.razorpay.keyId, // Public key for frontend checkout
+          keyId: config.razorpay.keyId,
         },
         society: {
           name: config.society.name,
@@ -142,6 +222,8 @@ router.post(
 );
 
 // ── Verify Payment (client-side callback) ───────────────────────────────────
+// This is called immediately after the Razorpay modal closes with success.
+// The webhook may arrive concurrently — both paths are idempotent.
 router.post(
   "/verify",
   authenticate,
@@ -154,7 +236,38 @@ router.post(
     try {
       const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body;
 
-      // Verify signature
+      // ── Find payment with ownership check ─────────────────────────────────
+      const existing = await prisma.payment.findFirst({
+        where: { razorpayOrderId, userId: req.user.id },
+        include: { user: true },
+      });
+
+      if (!existing) {
+        return res.status(404).json({ error: "Payment not found" });
+      }
+
+      // ── Idempotent success: webhook may have beaten the client callback ───
+      if (existing.status === "CAPTURED") {
+        return res.json({
+          success: true,
+          payment: {
+            id: existing.id,
+            transactionId: existing.transactionId,
+            baseAmount: existing.baseAmount,
+            surchargeRate: existing.surchargeRate,
+            surchargeAmount: existing.surchargeAmount,
+            gstOnSurcharge: existing.gstOnSurcharge,
+            totalAmount: existing.totalAmount,
+            paymentType: existing.paymentType,
+            paymentMethod: existing.paymentMethod,
+            status: existing.status,
+            paidAt: existing.paidAt,
+            razorpayPaymentId: existing.razorpayPaymentId,
+          },
+        });
+      }
+
+      // ── Signature verification ────────────────────────────────────────────
       const isValid = razorpayService.verifyPaymentSignature({
         razorpayOrderId,
         razorpayPaymentId,
@@ -162,49 +275,75 @@ router.post(
       });
 
       if (!isValid) {
-        // Mark as failed
-        await prisma.payment.updateMany({
-          where: { razorpayOrderId },
-          data: { status: "FAILED", failureReason: "Signature verification failed" },
+        // Log the bad attempt but do NOT auto-fail the payment: the webhook
+        // may still arrive and legitimately capture it.
+        await logPaymentEvent(prisma, {
+          paymentId: existing.id,
+          fromStatus: existing.status,
+          toStatus: existing.status,
+          source: "client_verify",
+          metadata: { error: "invalid_signature", razorpayPaymentId, ipAddress: req.ip },
         });
         return res.status(400).json({ error: "Payment verification failed — invalid signature" });
       }
 
-      // Update payment record and audit log atomically
-      const payment = await prisma.$transaction(async (tx) => {
-        const updated = await tx.payment.update({
-          where: { razorpayOrderId },
+      // ── Atomic conditional update (race-safe) ─────────────────────────────
+      // updateMany returns { count } — if count === 0 the webhook captured it
+      // first, which is fine. We fetch the current record either way.
+      const updated = await prisma.$transaction(async (tx) => {
+        const result = await tx.payment.updateMany({
+          where: {
+            razorpayOrderId,
+            userId: req.user.id,
+            status: { in: ["CREATED", "AUTHORIZED"] },
+          },
           data: {
             razorpayPaymentId,
             razorpaySignature,
             status: "CAPTURED",
             paidAt: new Date(),
           },
+        });
+
+        if (result.count === 0) {
+          // Webhook was faster — return null, caller fetches fresh record below
+          return null;
+        }
+
+        const p = await tx.payment.findFirst({
+          where: { razorpayOrderId },
           include: { user: true },
+        });
+
+        await logPaymentEvent(tx, {
+          paymentId: p.id,
+          fromStatus: existing.status,
+          toStatus: "CAPTURED",
+          source: "client_verify",
+          metadata: { razorpayPaymentId, totalAmount: p.totalAmount },
         });
 
         await tx.auditLog.create({
           data: {
-            userId: updated.userId,
+            userId: p.userId,
             action: "payment.captured",
             entityType: "payment",
-            entityId: updated.id,
-            metadata: { razorpayPaymentId, totalAmount: updated.totalAmount },
+            entityId: p.id,
+            metadata: { razorpayPaymentId, source: "client_verify", totalAmount: p.totalAmount },
             ipAddress: req.ip,
           },
         });
 
-        return updated;
+        return p;
       });
 
-      // Send email receipt (outside transaction — non-critical, best-effort)
-      const emailSent = await emailService.sendPaymentConfirmation(payment, payment.user);
-      if (emailSent) {
-        await prisma.payment.update({
-          where: { id: payment.id },
-          data: { emailSent: true },
-        });
-      }
+      const payment = updated || await prisma.payment.findFirst({
+        where: { razorpayOrderId },
+        include: { user: true },
+      });
+
+      // ── Email receipt (async, non-blocking) ───────────────────────────────
+      sendEmailAsync(payment, payment.user);
 
       res.json({
         success: true,
@@ -230,6 +369,107 @@ router.post(
   }
 );
 
+// ── Check Payment Status (client recovery) ──────────────────────────────────
+// Called by the frontend when /verify fails or the browser was interrupted.
+// For expired CREATED payments, queries Razorpay to reconcile the real state.
+router.get("/status/:orderId", authenticate, async (req, res) => {
+  try {
+    const payment = await prisma.payment.findFirst({
+      where: { razorpayOrderId: req.params.orderId, userId: req.user.id },
+      include: { user: true },
+    });
+
+    if (!payment) {
+      return res.status(404).json({ error: "Payment not found" });
+    }
+
+    // If already resolved, just return current state
+    if (payment.status !== "CREATED" && payment.status !== "AUTHORIZED") {
+      return res.json({
+        status: payment.status,
+        transactionId: payment.transactionId,
+        totalAmount: payment.totalAmount,
+        paidAt: payment.paidAt,
+      });
+    }
+
+    // ── Reconcile with Razorpay if the order has expired ─────────────────
+    const isExpired = payment.expiresAt && payment.expiresAt < new Date();
+    if (isExpired) {
+      try {
+        const rpPayments = await razorpayService.razorpay.orders.fetchPayments(req.params.orderId);
+        const captured = rpPayments.items?.find((p) => p.status === "captured");
+
+        if (captured) {
+          // Money was taken — mark CAPTURED and send email
+          await prisma.$transaction(async (tx) => {
+            await tx.payment.update({
+              where: { id: payment.id },
+              data: {
+                status: "CAPTURED",
+                paidAt: new Date(captured.created_at * 1000),
+                razorpayPaymentId: captured.id,
+              },
+            });
+            await logPaymentEvent(tx, {
+              paymentId: payment.id,
+              fromStatus: payment.status,
+              toStatus: "CAPTURED",
+              source: "reconcile",
+              metadata: { razorpayPaymentId: captured.id, trigger: "status_check" },
+            });
+          });
+
+          const refreshed = await prisma.payment.findUnique({
+            where: { id: payment.id },
+            include: { user: true },
+          });
+          sendEmailAsync(refreshed, refreshed.user);
+
+          return res.json({
+            status: "CAPTURED",
+            transactionId: payment.transactionId,
+            totalAmount: payment.totalAmount,
+            paidAt: new Date(captured.created_at * 1000),
+            recovered: true,
+          });
+        }
+
+        // No captured payment found — expire it
+        await prisma.$transaction(async (tx) => {
+          await tx.payment.update({
+            where: { id: payment.id },
+            data: { status: "FAILED", failureReason: "Order expired — no payment received" },
+          });
+          await logPaymentEvent(tx, {
+            paymentId: payment.id,
+            fromStatus: payment.status,
+            toStatus: "FAILED",
+            source: "reconcile",
+            metadata: { reason: "expired", trigger: "status_check" },
+          });
+        });
+
+        return res.json({ status: "FAILED", message: "Payment order expired" });
+      } catch (rpErr) {
+        // Razorpay API unreachable — don't change state, report current status
+        console.error("Razorpay reconcile failed:", rpErr.message);
+      }
+    }
+
+    res.json({
+      status: payment.status,
+      transactionId: payment.transactionId,
+      totalAmount: payment.totalAmount,
+      paidAt: payment.paidAt,
+      expiresAt: payment.expiresAt,
+    });
+  } catch (err) {
+    console.error("Status check error:", err);
+    res.status(500).json({ error: "Failed to check payment status" });
+  }
+});
+
 // ── Razorpay Webhook ────────────────────────────────────────────────────────
 router.post("/webhook", async (req, res) => {
   try {
@@ -240,78 +480,174 @@ router.post("/webhook", async (req, res) => {
 
     const rawBody = typeof req.body === "string" ? req.body : req.body.toString("utf8");
 
-    // Verify webhook signature
     const isValid = razorpayService.verifyWebhookSignature(rawBody, signature);
     if (!isValid) {
-      console.warn("⚠️  Invalid webhook signature received");
+      console.warn("Invalid webhook signature received");
       return res.status(400).json({ error: "Invalid signature" });
     }
 
     const event = JSON.parse(rawBody);
     const { event: eventType, payload } = event;
+    const razorpayEventId = event.id || null;
 
-    console.log(`📥 Webhook: ${eventType}`);
+    console.log(`Webhook: ${eventType}${razorpayEventId ? ` (${razorpayEventId})` : ""}`);
 
-    if (eventType === "payment.authorized") {
-      // Some payment methods (e.g. net banking) send authorized before captured.
-      // Mark as AUTHORIZED so the UI can show it as pending capture.
-      const rpPayment = payload.payment.entity;
-      const orderId = rpPayment.order_id;
-      await prisma.payment.updateMany({
-        where: { razorpayOrderId: orderId, status: "CREATED" },
+    // ── Deduplication: skip events we've already processed ────────────────
+    if (razorpayEventId) {
+      const seen = await prisma.webhookEvent.findUnique({
+        where: { razorpayEventId },
+      });
+      if (seen?.processed) {
+        console.log(`Skipping duplicate webhook event: ${razorpayEventId}`);
+        return res.json({ status: "ok" });
+      }
+    }
+
+    // ── Record the webhook event (upsert handles rare duplicate arrival) ──
+    const orderId = payload.payment?.entity?.order_id || null;
+    const webhookRecord = await prisma.webhookEvent.upsert({
+      where: { razorpayEventId: razorpayEventId ?? `no-id-${Date.now()}-${Math.random()}` },
+      create: {
+        razorpayEventId,
+        eventType,
+        orderId,
+        processed: false,
+        payload: event,
+      },
+      update: {},
+    });
+
+    // ── Process event inside a DB transaction ─────────────────────────────
+    try {
+      await processWebhookEvent(eventType, payload, webhookRecord.id);
+
+      await prisma.webhookEvent.update({
+        where: { id: webhookRecord.id },
+        data: { processed: true, processedAt: new Date() },
+      });
+    } catch (processErr) {
+      await prisma.webhookEvent.update({
+        where: { id: webhookRecord.id },
+        data: { error: processErr.message },
+      }).catch(() => {});
+      throw processErr;
+    }
+
+    res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Webhook error:", err);
+    // Always 200 to stop Razorpay retrying malformed/auth-failed events.
+    // Genuine processing failures return 500 so Razorpay will retry.
+    res.status(500).json({ error: "Webhook processing failed" });
+  }
+});
+
+async function processWebhookEvent(eventType, payload, webhookRecordId) {
+  const rpPayment = payload.payment?.entity;
+  if (!rpPayment) return;
+
+  const orderId = rpPayment.order_id;
+
+  if (eventType === "payment.authorized") {
+    // Some methods (net banking) send authorized before captured.
+    await prisma.$transaction(async (tx) => {
+      const existing = await tx.payment.findFirst({ where: { razorpayOrderId: orderId } });
+      if (!existing || existing.status !== "CREATED") return;
+
+      await tx.payment.update({
+        where: { id: existing.id },
         data: { razorpayPaymentId: rpPayment.id, status: "AUTHORIZED" },
       });
-    } else if (eventType === "payment.captured") {
-      const rpPayment = payload.payment.entity;
-      const orderId = rpPayment.order_id;
 
-      // Find the payment before update so we can check if email needs sending
-      const existing = await prisma.payment.findFirst({
-        where: { razorpayOrderId: orderId, status: { not: "CAPTURED" } },
-        include: { user: true },
+      await logPaymentEvent(tx, {
+        paymentId: existing.id,
+        fromStatus: "CREATED",
+        toStatus: "AUTHORIZED",
+        source: "webhook",
+        metadata: { razorpayPaymentId: rpPayment.id, webhookRecordId },
+      });
+    });
+
+  } else if (eventType === "payment.captured") {
+    const existing = await prisma.payment.findFirst({
+      where: { razorpayOrderId: orderId },
+      include: { user: true },
+    });
+
+    if (!existing || existing.status === "CAPTURED") return;
+
+    await prisma.$transaction(async (tx) => {
+      const result = await tx.payment.updateMany({
+        where: {
+          razorpayOrderId: orderId,
+          status: { in: ["CREATED", "AUTHORIZED"] },
+        },
+        data: {
+          razorpayPaymentId: rpPayment.id,
+          status: "CAPTURED",
+          paidAt: new Date(rpPayment.created_at * 1000),
+        },
       });
 
-      if (existing) {
-        await prisma.payment.updateMany({
-          where: { razorpayOrderId: orderId, status: { not: "CAPTURED" } },
-          data: {
-            razorpayPaymentId: rpPayment.id,
-            status: "CAPTURED",
-            paidAt: new Date(rpPayment.created_at * 1000),
-          },
-        });
+      if (result.count === 0) return; // Client verify was faster
 
-        // Send email if not already sent (covers case where /verify never reached)
-        if (!existing.emailSent) {
-          const emailSent = await emailService.sendPaymentConfirmation(existing, existing.user);
-          if (emailSent) {
-            await prisma.payment.updateMany({
-              where: { razorpayOrderId: orderId },
-              data: { emailSent: true },
-            });
-          }
-        }
+      await logPaymentEvent(tx, {
+        paymentId: existing.id,
+        fromStatus: existing.status,
+        toStatus: "CAPTURED",
+        source: "webhook",
+        metadata: { razorpayPaymentId: rpPayment.id, webhookRecordId },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          userId: existing.userId,
+          action: "payment.captured",
+          entityType: "payment",
+          entityId: existing.id,
+          metadata: { razorpayPaymentId: rpPayment.id, source: "webhook", totalAmount: existing.totalAmount },
+        },
+      });
+    });
+
+    // Email (if not already sent by /verify)
+    const refreshed = await prisma.payment.findUnique({ where: { id: existing.id } });
+    sendEmailAsync({ ...existing, ...refreshed }, existing.user);
+
+  } else if (eventType === "payment.failed") {
+    await prisma.$transaction(async (tx) => {
+      const existing = await tx.payment.findFirst({ where: { razorpayOrderId: orderId } });
+      if (!existing) return;
+
+      // NEVER downgrade a CAPTURED payment to FAILED (edge case: out-of-order events)
+      if (existing.status === "CAPTURED") {
+        console.warn(`Ignoring payment.failed for already-CAPTURED order ${orderId}`);
+        return;
       }
-    } else if (eventType === "payment.failed") {
-      const rpPayment = payload.payment.entity;
-      const orderId = rpPayment.order_id;
 
-      await prisma.payment.updateMany({
-        where: { razorpayOrderId: orderId },
+      await tx.payment.update({
+        where: { id: existing.id },
         data: {
           status: "FAILED",
           failureReason: rpPayment.error_description || "Payment failed",
         },
       });
-    }
 
-    // Always respond 200 to acknowledge webhook
-    res.json({ status: "ok" });
-  } catch (err) {
-    console.error("Webhook error:", err);
-    res.status(500).json({ error: "Webhook processing failed" });
+      await logPaymentEvent(tx, {
+        paymentId: existing.id,
+        fromStatus: existing.status,
+        toStatus: "FAILED",
+        source: "webhook",
+        metadata: {
+          error: rpPayment.error_description,
+          errorCode: rpPayment.error_code,
+          razorpayPaymentId: rpPayment.id,
+          webhookRecordId,
+        },
+      });
+    });
   }
-});
+}
 
 // ── Payment History (for logged-in resident) ────────────────────────────────
 router.get("/history", authenticate, async (req, res) => {
@@ -370,7 +706,6 @@ router.get("/receipt/:transactionId", authenticate, async (req, res) => {
       return res.status(404).json({ error: "Payment not found" });
     }
 
-    // Only allow own payments or admin
     if (payment.userId !== req.user.id && req.user.role === "RESIDENT") {
       return res.status(403).json({ error: "Access denied" });
     }
@@ -409,7 +744,6 @@ router.get("/receipt/:transactionId/pdf", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Receipt available only for successful payments" });
     }
 
-    // Try to generate PDF (pdfkit is optional dependency)
     try {
       const receiptService = require("../services/receipt");
       const pdfBuffer = await receiptService.generateReceipt(payment);
@@ -421,13 +755,9 @@ router.get("/receipt/:transactionId/pdf", authenticate, async (req, res) => {
       );
       res.send(pdfBuffer);
     } catch (pdfErr) {
-      // If pdfkit not installed, return JSON receipt instead
       console.warn("PDF generation failed (pdfkit may not be installed):", pdfErr.message);
       res.json({
-        receipt: {
-          ...payment,
-          society: config.society,
-        },
+        receipt: { ...payment, society: config.society },
         note: "PDF generation requires pdfkit. Install with: npm install pdfkit",
       });
     }
